@@ -1,0 +1,222 @@
+// This file contains the google cloud shell commands to setup the environment and dataproc cluster as well as
+// the hive queries executed in the google dataproc cluster hive server
+
+// The following contains only the queries run to create the tables used for data preprocessing and analysis
+// The team spent a lot of time learning HiveQL through executing queries and creating tables that are not included here
+
+// Setup environment where dataproc cluster should be created:
+export REGION=us-central1
+export ZONE=us-central1-a
+gcloud config set compute/zone ${ZONE}
+
+
+// Enable the Dataproc and Cloud SQL Admin APIs:
+gcloud services enable dataproc.googleapis.com sqladmin.googleapis.com
+
+
+// Create the warehouse bucket to store dataset and hive data:
+export PROJECT=$(gcloud info --format='value(config.project)')
+gsutil mb -l ${REGION} gs://${PROJECT}-warehouse
+
+
+// Create the Cloud SQL instance to host the hive metastore:
+gcloud sql instances create hive-metastore \
+    --database-version="MYSQL_5_7" \
+    --activation-policy=ALWAYS \
+    --zone ${ZONE}
+
+
+// Create the Dataproc cluster:
+gcloud dataproc clusters create hive-cluster \
+    --scopes sql-admin \
+    --region ${REGION} \
+    --initialization-actions gs://goog-dataproc-initialization-actions-${REGION}/cloud-sql-proxy/cloud-sql-proxy.sh \
+    --properties hive:hive.metastore.warehouse.dir=gs://${PROJECT}-warehouse/datasets \
+    --metadata "hive-metastore-instance=${PROJECT}:${REGION}:hive-metastore" \
+    --metadata "enable-cloud-sql-proxy-on-workers=false"
+
+
+// After copying dataset CSV file into gs://${PROJECT}-warehouse/datasets/SandP/ we loaded this data into a hive table
+// via the dataproc jobs api:
+gcloud dataproc jobs submit hive \
+    --cluster hive-cluster \
+    --region ${REGION} \
+    --execute "
+      DROP TABLE IF EXISTS sandp500table;
+      CREATE EXTERNAL TABLE sandp500table
+      (spdate STRING,
+      sptime STRING,
+      price DOUBLE,
+      volume INT)
+      ROW FORMAT DELIMITED
+      FIELDS TERMINATED BY ','
+      STORED AS TEXTFILE
+      LOCATION 'gs://${PROJECT}-warehouse/datasets/SandP'
+      TBLPROPERTIES('skip.header.line.count'='1');"
+
+
+// Subsequent hive queries were executed via a Beeline session:
+// first we opened an ssh session with the dataproc's master instance:
+gcloud compute ssh hive-cluster-m
+
+// We then opened Beeline session:
+beeline -u "jdbc:hive2://localhost:10000"
+
+
+// We created a table stored as ORC file from the external table created
+CREATE TABLE sandp500table_orc
+    (spdate STRING,
+    sptime STRING,
+    price DOUBLE,
+    volume INT)
+    STORED AS ORC;
+
+INSERT INTO TABLE sandp500table_orc
+    SELECT *
+    FROM sandp500table;
+
+
+// Create a new table with the date formatted correctly in a new column and a new timestamp column
+CREATE TABLE sandp500table_timestamps
+    (spdate STRING,
+    sptime STRING,
+    date_formatted DATE,
+    timestamp_format TIMESTAMP,
+    price DOUBLE,
+    volume INT)
+    STORED AS ORC;
+
+INSERT INTO TABLE sandp500table_timestamps
+    SELECT spdate,
+    sptime,
+    cast(from_unixtime(unix_timestamp(spdate,'MM/dd/yyyy'),'yyyy-MM-dd') as date),
+    cast(CONCAT(cast(from_unixtime(unix_timestamp(spdate,'MM/dd/yyyy'),'yyyy-MM-dd') as date),' ',sptime),
+    price,
+    volume
+    FROM sandp500table_orc;
+
+
+// We created a base table of timestamp, date and price columns WITH all duplicate timestamp/date rows removed
+CREATE TABLE sandp500table_base
+    (timestamp_format TIMESTAMP,
+    date_formatted DATE,
+    price DOUBLE)
+    STORED AS ORC;
+
+INSERT INTO TABLE sandp500table_base
+    SELECT timestamp_format,
+    date_formatted,
+    avg(price)
+    FROM sandp500table_timestamps
+    GROUP BY timestamp_format, date_formatted
+    ORDER BY timestamp_format;
+
+
+// Create table sandp500table_basetmp to hold daily price high, low, avg, and the timestamps of the opening and closing prices
+CREATE TABLE sandp500table_basetmp
+    (date_formatted DATE,
+    price_low DOUBLE,
+    price_high DOUBLE,
+    price_avg DOUBLE,
+    opening_timestamp TIMESTAMP,
+    closing_timestamp TIMESTAMP)
+    STORED AS ORC;
+
+INSERT INTO TABLE sandp500table_basetmp
+    SELECT
+    date_formatted,
+    min(price),
+    max(price),
+    avg(price),
+    min(timestamp_format),
+    max(timestamp_format)
+    FROM sandp500table_base
+    GROUP BY date_formatted
+    ORDER BY date_formatted;
+
+
+// Create a table with opening prices
+CREATE TABLE opening_prices(
+    timestamp_format TIMESTAMP,
+    date_formatted DATE,
+    opening_price DOUBLE)
+    STORED AS ORC;
+
+INSERT INTO TABLE opening_prices
+    SELECT timestamp_format,
+    date_formatted,
+    price
+    FROM sandp500table_base
+    WHERE timestamp_format IN
+        (SELECT min(timestamp_format)
+        FROM sandp500table_base
+        GROUP BY date_formatted)
+    ORDER BY date_formatted;
+
+
+// Create a table with closing prices
+CREATE TABLE closing_prices(
+    timestamp_format TIMESTAMP,
+    date_formatted DATE,
+    closing_price DOUBLE)
+    STORED AS TEXTFILE;
+
+INSERT INTO TABLE closing_prices
+    SELECT timestamp_format,
+    date_formatted,
+    price
+    FROM sandp500table_base
+    WHERE timestamp_format IN
+        (SELECT max(timestamp_format)
+        FROM sandp500table_base
+        GROUP BY date_formatted)
+    ORDER BY date_formatted;
+
+
+// Create a table with the daily price low, price high, price average, opening and closing prices and the opening and closing timestamps
+CREATE TABLE sandp500table_joined(
+    date_formatted DATE,
+    price_low DOUBLE,
+    price_high DOUBLE,
+    price_average DOUBLE,
+    opening_price DOUBLE,
+    closing_price DOUBLE,
+    opening_timestamp TIMESTAMP,
+    closing_timestamp TIMESTAMP)
+    STORED AS ORC;
+
+INSERT INTO TABLE sandp500table_joined
+    SELECT
+    sandp500table_basetmp.date_formatted,
+    sandp500table_basetmp.price_low,
+    sandp500table_basetmp.price_high,
+    sandp500table_basetmp.price_average,
+    opening_prices.price,
+    closing_prices.price,
+    sandp500table_basetmp.opening_timestamp,
+    sandp500table_basetmp.closing_timestamp
+    FROM
+    (
+        (
+            sandp500table_basetmp INNER JOIN
+            opening_prices
+            ON sandp500table_basetmp.date_formatted = opening_prices.date_formatted
+        )
+        INNER JOIN
+        closing_prices
+        ON sandp500table_basetmp.date_formatted = closing_prices.date_formatted
+    )
+    ORDER BY date_formatted;
+
+
+// Create table with daily market momentum
+CREATE TABLE sandp500table_mm(
+    date_formatted DATE,
+    market_momentum DOUBLE)
+    STORED AS ORC;
+
+INSERT INTO TABLE sandp500table_mm
+    SELECT date_formatted,
+    closing_price - LAG(closing_price, 10)
+    OVER (ORDER BY date_formatted)
+    FROM sandp500table_joined;
